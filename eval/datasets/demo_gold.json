@@ -1,0 +1,20 @@
+{
+  "1": {"gold": ["dogovor-a-08-2024#p-3.1", "dogovor-a-08-2024#p-3.2"], "expect": "answer", "category": ["contract_fact"]},
+  "2": {"gold": ["tk-rf-st-70#ch-5"], "expect": "answer", "category": ["law_fact"]},
+  "3": {"gold": [], "expect": "refuse", "category": ["not_in_kb"]},
+  "4": {"gold": ["dogovor-a-08-2024#p-3.1", "dogovor-a-08-2024#p-3.4"], "expect": "false_premise", "category": ["false_premise", "contract_fact"]},
+  "5": {"gold": ["reglament-soglasovaniya-dogovorov-red-10-01-2023#p-2.4", "reglament-soglasovaniya-dogovorov-red-01-03-2025#p-2.4"], "expect": "answer", "category": ["edition_by_date"]},
+  "6": {"gold": ["dogovor-p-17-2024#p-6.1"], "expect": "answer", "category": ["dialog", "contract_fact"]},
+  "7": {"gold": ["dogovor-a-08-2024#p-4.3"], "expect": "answer", "category": ["paraphrase", "contract_fact"]},
+  "8": {"gold": ["dogovor-p-17-2024#p-6.2"], "expect": "answer", "category": ["entity_disambiguation", "contract_fact"]},
+  "9": {"gold": ["dogovor-pt-05-2023#p-4.2", "dogovor-pt-05-2023#p-4.1"], "expect": "answer", "category": ["entity_disambiguation", "contract_fact"]},
+  "10": {"gold": ["reglament-soglasovaniya-dogovorov-red-01-03-2025#p-1.3"], "expect": "answer", "category": ["internal_regulation"]},
+  "11": {"gold": ["sluzhebnaya-zapiska-yuo-7#abz-3"], "expect": "answer", "category": ["internal_memo"]},
+  "12": {"gold": ["tk-rf-st-70#ch-3"], "expect": "answer", "category": ["law_fact"]},
+  "13": {"gold": ["152-fz-st-9#ch-2"], "expect": "partial", "category": ["partial", "law_fact"]},
+  "14": {"gold": ["tk-rf-st-59#ch-1"], "expect": "answer", "category": ["law_fact", "paraphrase"]},
+  "15": {"gold": ["dogovor-a-08-2024#p-6.3"], "expect": "answer", "category": ["dialog", "contract_fact"]},
+  "16": {"gold": ["dogovor-p-17-2024#p-2.1"], "expect": "answer", "category": ["dialog", "contract_fact"]},
+  "17": {"gold": ["dogovor-pt-05-2023#p-6.1"], "expect": "answer", "category": ["dialog", "entity_disambiguation"]},
+  "18": {"gold": ["reglament-soglasovaniya-dogovorov-red-01-03-2025#p-3.2"], "expect": "answer", "category": ["dialog", "internal_regulation"]}
+}
