@@ -6,6 +6,7 @@ import sys
 
 import httpx
 
+KEEPALIVE_SECONDS = 90.0
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524}
 
 
@@ -26,7 +27,7 @@ def client(base_url: str, timeout: float) -> httpx.AsyncClient:
         c = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=KEEPALIVE_SECONDS),
         )
         _clients[key] = c
     return c

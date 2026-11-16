@@ -55,6 +55,20 @@ def assistant() -> Assistant:
     return state["assistant"]
 
 
+def log_timing(res: AnswerResult, question: str) -> None:
+    steps, calls, retrieve = {}, [], {}
+    for s in res.trace:
+        name = s.get("step", "")
+        if name.startswith("llm:"):
+            calls.append([name[4:], s.get("seconds"), s.get("at")])
+        elif name and "at" in s:
+            steps[name] = s["at"]
+        if name == "retrieve":
+            retrieve = {"search": s.get("search"), "rerank": s.get("rerank")}
+    record = {"time": time.strftime("%H:%M:%S"), "seconds": round(res.seconds, 2), "status": res.status, "question": question[:100], "steps": steps, "retrieve": retrieve, "llm": calls}
+    print(json.dumps(record, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def _text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -160,6 +174,7 @@ async def chat(request: Request):
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     if not body.get("stream"):
         res = await assistant().answer(turns, mode="ui")
+        log_timing(res, last_user)
         return JSONResponse({
             "id": cid, "object": "chat.completion", "created": int(time.time()), "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text(res), "reasoning_content": res.reasoning}, "finish_reason": "stop"}],
@@ -175,6 +190,7 @@ async def chat(request: Request):
     async def worker() -> None:
         try:
             res = await assistant().answer(turns, mode="ui", emit=emit)
+            log_timing(res, last_user)
             await queue.put({"type": "result", "result": res})
         except Exception as exc:
             print(f"chat error: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -40,6 +40,8 @@ from .retrieve import Hit, Plan, Retriever, SearchCache
 from .verify import SID_RE, deterministic_issues
 
 Emit = Callable[[dict], Awaitable[None]]
+Check = Callable[[str], Awaitable[list[dict]]]
+Complete = Callable[[str], Awaitable[str]]
 STATUSES = {"answer", "partial", "insufficient", "false_premise", "clarify", "refusal_illegal", "offtopic"}
 MIN_SELECTED = 3
 MAX_VERIFIED = 3
@@ -54,6 +56,16 @@ COUNTERPARTY_HINT_RE = re.compile(r"[Дд]оговор|(?<!\w)(?:ООО|АО|П�
 UNGRADED_TOP = 5
 DIGIT_RE = re.compile(r"\d")
 RELATIVE_DATE_NOTE = " — вычислена системой от сегодняшней даты; в ответе называй её словами пользователя, календарную дату не пиши"
+
+
+class TimedTrace(list):
+    def __init__(self, start: float) -> None:
+        super().__init__()
+        self.start = start
+
+    def append(self, item: dict) -> None:
+        item.setdefault("at", round(time.monotonic() - self.start, 2))
+        super().append(item)
 
 
 def _majority(values: list) -> object:
@@ -80,6 +92,25 @@ def rank_candidates(cands: list[dict], required: list[list[str]] | None = None) 
         return sum(1 for group in required or [] if not cited & set(group)), abs(len(answer) - typical), len(answer)
 
     return sorted(agreed, key=cost)
+
+
+def majority(cands: list[dict], count: int) -> bool:
+    if len(cands) >= count:
+        return True
+    groups = Counter((_unpack(c)[1], _polarity(c)) for c in cands)
+    return bool(groups) and groups.most_common(1)[0][1] > count // 2
+
+
+def choose(good: list[dict], count: int, required: list[list[str]], verified: Callable[[dict], bool], generating: bool) -> list[dict]:
+    if not good or (generating and not majority(good, count)):
+        return []
+    ranked = rank_candidates(good, required)
+    for cand in ranked[:MAX_VERIFIED]:
+        if not verified(cand):
+            return []
+        if not cand.get("_issues"):
+            return ranked
+    return [] if generating else ranked
 
 
 def _polarity(cand: dict) -> str:
@@ -157,7 +188,7 @@ class Assistant:
         self.catalog = build_catalog(index)
         self.company = our_company(index)
 
-    def _plan(self, a: Analysis, last: str, dialog: bool) -> Plan:
+    def _plan(self, a: Analysis, last: str, rerank_query: str) -> Plan:
         boost: dict[str, float] = {}
         for doc_id, conf in a.documents.items():
             boost[doc_id] = max(boost.get(doc_id, 0.0), 0.25 + 0.75 * conf)
@@ -165,7 +196,7 @@ class Assistant:
             for doc_id in amb["candidates"]:
                 boost[doc_id] = max(boost.get(doc_id, 0.0), 0.6)
         queries = [a.standalone, last] + a.sub_questions + a.search_queries
-        return Plan(queries=queries, hyde=[a.hyde] if a.hyde else [], doc_boost=boost, pinned=list(a.references), rerank_query=a.standalone if dialog else last)
+        return Plan(queries=queries, hyde=[a.hyde] if a.hyde else [], doc_boost=boost, pinned=list(a.references), rerank_query=rerank_query)
 
     def _best_in_doc(self, doc_id: str, queries: list[str], k: int = 2) -> list[int]:
         ids = self.index.doc_chunks.get(doc_id, [])
@@ -291,31 +322,63 @@ class Assistant:
         data["_raw"] = res.content
         return data
 
-    async def _generate_checked(self, messages: list[dict], think: bool, variant: int, check: Callable[[str], Awaitable[list[dict]]] | None, trace: list[dict]) -> dict:
-        cand = await self._generate(messages, think, variant)
+    async def _post(self, cand: dict, variant: int, check: Check | None, complete: Complete | None, trace: list[dict]) -> None:
         answer, status = _unpack(cand)
-        if check is None or not answer or status == "offtopic":
-            return cand
-        t = time.monotonic()
-        try:
-            cand["_issues"] = await check(answer)
-        except Exception as exc:
-            trace.append({"step": "verify", "error": type(exc).__name__})
-            return cand
-        trace.append({"step": f"verify:{variant}", "seconds": round(time.monotonic() - t, 2), "llm": cand["_issues"]})
-        return cand
+        jobs: dict[str, Awaitable] = {}
+        if check is not None and status != "offtopic":
+            jobs["verify"] = check(answer)
+        if complete is not None and status in COMPLETABLE:
+            jobs["complete"] = complete(answer)
+        done = dict(zip(jobs, await asyncio.gather(*jobs.values(), return_exceptions=True)))
+        for name, value in done.items():
+            if isinstance(value, BaseException):
+                trace.append({"step": name, "error": type(value).__name__})
+        if isinstance(done.get("verify"), list):
+            cand["_issues"] = done["verify"]
+            trace.append({"step": f"verify:{variant}", "llm": cand["_issues"]})
+        if isinstance(done.get("complete"), str):
+            cand["_addition"] = done["complete"]
 
-    async def _ranked_candidates(self, messages: list[dict], think: bool, count: int, trace: list[dict], required: list[list[str]], check: Callable[[str], Awaitable[list[dict]]] | None) -> list[dict]:
-        results = await asyncio.gather(*(self._generate_checked(messages, think, i, check if count > 1 else None, trace) for i in range(count)), return_exceptions=True)
-        good = [r for r in results if isinstance(r, dict) and str(r.get("answer") or "").strip()]
-        if not good:
-            errors = [r for r in results if isinstance(r, BaseException)]
-            if errors:
-                raise errors[0]
-            return [results[0]]
-        ranked = rank_candidates(good, required)
-        if len(good) > 1:
-            trace.append({"step": "candidates", "count": len(good), "statuses": [str(c.get("status")) for c in good], "agreed": len(ranked)})
+    async def _ranked_candidates(self, messages: list[dict], think: bool, count: int, trace: list[dict], required: list[list[str]], check: Check | None, complete: Complete | None) -> list[dict]:
+        check = check if count > 1 else None
+        gens = {asyncio.create_task(self._generate(messages, think, i)): i for i in range(count)}
+        posts: dict[int, asyncio.Task] = {}
+        cands: dict[int, dict] = {}
+        errors: list[BaseException] = []
+        ranked: list[dict] = []
+        generating = False
+        try:
+            while True:
+                for task, i in gens.items():
+                    if not task.done() or i in cands or task.cancelled():
+                        continue
+                    if task.exception() is not None:
+                        errors.append(task.exception())
+                        cands[i] = {}
+                        continue
+                    cands[i] = {**task.result(), "_variant": i}
+                    if _unpack(cands[i])[0]:
+                        posts[i] = asyncio.create_task(self._post(cands[i], i, check, complete, trace))
+                good = [c for c in cands.values() if _unpack(c)[0]] if cands else []
+                generating = any(not t.done() for t in gens)
+                ranked = choose(good, count, required, lambda c: c["_variant"] not in posts or posts[c["_variant"]].done(), generating)
+                pending = {t for t in gens if not t.done()} | {t for t in posts.values() if not t.done()}
+                if ranked or not pending:
+                    break
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in [*gens, *posts.values()]:
+                task.cancel()
+            await asyncio.gather(*gens, *posts.values(), return_exceptions=True)
+        if not ranked:
+            good = [c for c in cands.values() if _unpack(c)[0]]
+            if not good:
+                if errors:
+                    raise errors[0]
+                return list(cands.values())[:1] or [{}]
+            ranked = rank_candidates(good, required)
+        if count > 1:
+            trace.append({"step": "candidates", "count": len(good), "statuses": [str(c.get("status")) for c in good], "agreed": len(ranked), "early": generating})
         return ranked
 
     async def _verify(self, a: Analysis, answer: str, frags: list[Fragment], history: str) -> list[dict]:
@@ -377,7 +440,7 @@ class Assistant:
     async def answer(self, turns: list[Turn], *, mode: str = "submission", economy: bool = False, emit: Emit | None = None) -> AnswerResult:
         emit = emit or _noop
         start = time.monotonic()
-        trace: list[dict] = []
+        trace: list[dict] = TimedTrace(start)
         CALL_TRACE.set(trace)
         links = mode == "ui" or self.s.render_links
         one_line = mode == "submission"
@@ -392,7 +455,8 @@ class Assistant:
         await emit({"type": "status", "text": "Разбираю вопрос и определяю документы"})
         t = time.monotonic()
         cache = SearchCache()
-        warm = asyncio.create_task(self._warm_search(last, cache))
+        seed = "\n".join(turn.content for turn in turns if turn.role == "user") if len(turns) > 1 else last
+        warm = asyncio.create_task(self._warm_search(seed, cache))
         a = await analyze(self.llm, self.index, self.catalog, turns, self.s.today)
         trace.append({"step": "analyze", "seconds": round(time.monotonic() - t, 2), "llm_ok": a.llm_ok, "documents": a.documents, "flags": sorted(a.flags), "dropped": a.dropped})
         await emit({"type": "reasoning", "text": self._reason_analysis(a)})
@@ -401,15 +465,11 @@ class Assistant:
 
         await emit({"type": "status", "text": "Ищу положения в базе знаний"})
         t = time.monotonic()
-        plan = self._plan(a, last, dialog=len(turns) > 1)
-        warm_used = plan.rerank_query == last
-        if warm_used:
-            await warm
-        else:
-            warm.cancel()
+        plan = self._plan(a, last, seed)
+        await warm
         hits = await self.retriever.search(plan, k_channel=40, k_out=60, cache=cache)
         t_search = time.monotonic()
-        reused = sum(h.idx in cache.rerank for h in hits[: self.s.rerank_top_n]) if warm_used else 0
+        reused = sum(h.idx in cache.rerank for h in hits[: self.s.rerank_top_n])
         hits = await self.retriever.rerank(plan.rerank_query, hits, top_n=self.s.rerank_top_n, cache=cache)
         t_rerank = time.monotonic()
         hits = self._ensure_docs(hits, a)
@@ -464,24 +524,34 @@ class Assistant:
                 return []
             return await self._verify(a, answer, selected, history)
 
+        async def precomplete(answer: str) -> str:
+            return await self._complete(a.standalone, answer, selected)
+
         try:
-            ranked = await self._ranked_candidates(messages, think, 1 if economy else self.s.candidates, trace, required, check if self.s.verify and not economy else None)
+            ranked = await self._ranked_candidates(messages, think, 1 if economy else self.s.candidates, trace, required, check if self.s.verify and not economy else None, precomplete if self.s.complete and not economy else None)
         except Exception as exc:
             trace.append({"step": "generate", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
             text, cites, notes = self._fallback(selected, links, one_line)
             return AnswerResult(text=text, status="answer", citations=cites, footnotes=notes, fragments=selected, analysis=a, trace=trace, seconds=elapsed(), error=str(exc)[:300])
         trace.append({"step": "generate", "seconds": round(time.monotonic() - t, 2), "status": ranked[0].get("status")})
 
-        data = next((c for c in ranked[:MAX_VERIFIED] if not c.get("_issues")), ranked[0])
+        check_context = f"{context_text}\n{ab}"
+
+        def formal_issues(text: str, st: str) -> list[str]:
+            return deterministic_issues(text, st, selected, check_context, last, self.s.today, company, required)
+
+        verified = [c for c in ranked[:MAX_VERIFIED] if not c.get("_issues")] or ranked[:1]
+        data = next((c for c in verified if not formal_issues(*_unpack(c))), verified[0])
         answer, status = _unpack(data)
+        drafted = answer
         reasoning = str(data.get("analysis") or "")
         if data.get("_reasoning"):
             reasoning = str(data["_reasoning"]) + ("\n\n" + reasoning if reasoning else "")
         await emit({"type": "reasoning", "text": reasoning})
 
-        check_context = f"{context_text}\n{ab}"
-        formal = deterministic_issues(answer, status, selected, check_context, last, self.s.today, company, required)
-        if formal and elapsed() < self.s.question_budget * 0.8:
+        formal = formal_issues(answer, status)
+        limit = self.s.question_budget * 0.8
+        if formal and elapsed() < limit:
             feedback = "\n".join(f"- {x}" for x in formal)
             await emit({"type": "reasoning", "text": "Проверка нашла замечания, исправляю:\n" + feedback})
             t = time.monotonic()
@@ -492,7 +562,7 @@ class Assistant:
                     echo = {"analysis": data["analysis"], **echo}
                 revised = await self._generate(messages + [{"role": "assistant", "content": json.dumps(echo, ensure_ascii=False)}, {"role": "user", "content": REVISE_USER.format(issues=feedback)}], think)
                 new_answer, new_status = _unpack(revised, status)
-                accepted = bool(new_answer) and len(deterministic_issues(new_answer, new_status, selected, check_context, last, self.s.today, company, required)) < len(formal)
+                accepted = bool(new_answer) and len(formal_issues(new_answer, new_status)) < len(formal)
                 if accepted:
                     answer, status = new_answer, new_status
                     reasoning = str(revised.get("analysis") or reasoning)
@@ -501,21 +571,22 @@ class Assistant:
                 trace.append({"step": "revise", "error": f"{type(exc).__name__}"})
             trace.append({"step": "revise", "seconds": round(time.monotonic() - t, 2), "issues": formal, "status": status, "accepted": accepted})
 
-        deadline = self.s.ui_deadline if mode == "ui" else self.s.question_budget * 0.8
-        if self.s.complete and answer and status in COMPLETABLE and not economy and elapsed() < deadline:
+        ready = answer == drafted and "_addition" in data
+        if self.s.complete and answer and status in COMPLETABLE and not economy and (ready or elapsed() < limit):
             t = time.monotonic()
-            addition, accepted = "", False
-            try:
-                addition = await self._complete(a.standalone, answer, selected)
-            except Exception as exc:
-                trace.append({"step": "complete", "error": type(exc).__name__})
+            addition, accepted = str(data["_addition"]) if ready else "", False
+            if not ready:
+                try:
+                    addition = await self._complete(a.standalone, answer, selected)
+                except Exception as exc:
+                    trace.append({"step": "complete", "error": type(exc).__name__})
             if addition:
                 merged = f"{answer.rstrip()} {addition}"
-                before, after = (len(deterministic_issues(x, status, selected, check_context, last, self.s.today, company, required)) for x in (answer, merged))
+                before, after = (len(formal_issues(x, status)) for x in (answer, merged))
                 accepted = after <= before
                 if accepted:
                     answer = merged
-            trace.append({"step": "complete", "seconds": round(time.monotonic() - t, 2), "addition": addition, "accepted": accepted})
+            trace.append({"step": "complete", "seconds": round(time.monotonic() - t, 2), "addition": addition, "accepted": accepted, "ready": ready})
 
         if not answer:
             text, cites, notes = self._fallback(selected, links, one_line)

@@ -19,4 +19,5 @@ tests
 *.pdf
 drive-download-*.zip
 secrets
-artifacts/cache
+artifacts
+data

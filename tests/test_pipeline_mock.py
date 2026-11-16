@@ -21,13 +21,15 @@ pytestmark = pytest.mark.usefixtures("kb_path")
 
 
 class FakeLLM(LLM):
-    def __init__(self, s, script):
+    def __init__(self, s, script, delays=None):
         super().__init__(s)
         self.script = script
         self.seen = []
+        self.delays = delays or {}
 
     async def _raw(self, payload, stage):
         self.seen.append(stage)
+        await asyncio.sleep(self.delays.get(stage, 0))
         content = self.script[stage.split(":")[0]](payload)
         self.usage.add(stage, {}, 0.0)
         return LLMResult(content=content)
@@ -226,11 +228,59 @@ def test_candidates_are_generated_in_parallel_and_one_is_used():
     s = _settings()
     s.candidates = 3
     s.verify = False
-    llm = FakeLLM(s, {"analyze": analyze, "grade": grade, "generate": generate})
+    llm = FakeLLM(s, {"analyze": analyze, "grade": grade, "generate": generate}, delays={"generate:2": 5.0})
     res = asyncio.run(Assistant(s, _index(), llm, None, None).answer(parse_dialog("Какая арендная плата по договору с ООО «Северный Склад»?"), mode="submission"))
     assert res.text.startswith("Арендная плата вносится ежемесячно")
     assert sorted(x for x in llm.seen if x.startswith("generate")) == ["generate", "generate:1", "generate:2"]
-    assert any(step.get("step") == "candidates" and step.get("count") == 3 for step in res.trace)
+    assert any(step.get("step") == "candidates" and step.get("count") == 2 and step.get("early") for step in res.trace)
+    assert res.seconds < 2
+
+
+def test_ui_waits_for_agreeing_candidates():
+    def analyze(_):
+        return json.dumps({"standalone_question": "Арендная плата по договору А-08/2024", "scope": "legal", "documents": [{"doc_id": "dogovor-a-08-2024", "confidence": 0.95}]})
+
+    def grade(payload):
+        sids = re.findall(r"^\[(S\d+)\] .*А-08", payload["messages"][1]["content"], re.M)
+        return json.dumps({"relevance": {sid: 3 for sid in sids}})
+
+    def generate(payload):
+        sid = re.search(r"^\[(S\d+)\]", payload["messages"][1]["content"], re.M).group(1)
+        return json.dumps({"status": "answer", "answer": f"Арендная плата вносится ежемесячно [{sid}]."})
+
+    s = _settings()
+    s.candidates = 3
+    llm = FakeLLM(s, {"analyze": analyze, "grade": grade, "generate": generate, "verify": _ok_verify}, delays={"generate:1": 1.0, "generate:2": 5.0})
+    res = asyncio.run(Assistant(s, _index(), llm, None, None).answer(parse_dialog("Какая арендная плата по договору с ООО «Северный Склад»?"), mode="ui"))
+    assert res.text.startswith("Арендная плата вносится ежемесячно")
+    assert any(step.get("step") == "candidates" and step.get("count") == 2 and step.get("early") for step in res.trace)
+    assert 1.0 <= res.seconds < 2
+
+
+def test_disagreeing_candidates_wait_for_the_third():
+    def analyze(_):
+        return json.dumps({"standalone_question": "Арендная плата по договору А-08/2024", "scope": "legal", "documents": [{"doc_id": "dogovor-a-08-2024", "confidence": 0.95}]})
+
+    def grade(payload):
+        sids = re.findall(r"^\[(S\d+)\] .*А-08", payload["messages"][1]["content"], re.M)
+        return json.dumps({"relevance": {sid: 3 for sid in sids}})
+
+    made = {"n": 0}
+
+    def generate(payload):
+        made["n"] += 1
+        sid = re.search(r"^\[(S\d+)\]", payload["messages"][1]["content"], re.M).group(1)
+        if made["n"] == 2:
+            return json.dumps({"status": "insufficient", "answer": "В базе знаний нет документов об этом."})
+        return json.dumps({"status": "answer", "answer": f"Арендная плата вносится ежемесячно [{sid}]."})
+
+    s = _settings()
+    s.candidates = 3
+    s.verify = False
+    llm = FakeLLM(s, {"analyze": analyze, "grade": grade, "generate": generate})
+    res = asyncio.run(Assistant(s, _index(), llm, None, None).answer(parse_dialog("Какая арендная плата по договору с ООО «Северный Склад»?"), mode="submission"))
+    assert res.status == "answer"
+    assert any(step.get("step") == "candidates" and step.get("count") == 3 and not step.get("early") for step in res.trace)
 
 
 def test_verification_rejects_candidate_and_takes_next_one():

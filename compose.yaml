@@ -5,7 +5,8 @@ services:
     build:
       context: .
       args:
-        WITH_LOCAL_MODELS: ${WITH_LOCAL_MODELS:-false}
+        WITH_LOCAL_MODELS: ${WITH_LOCAL_MODELS:-true}
+    image: psb-legal-api:local
     env_file:
       - path: .env
         required: false
@@ -13,18 +14,21 @@ services:
       DATA_DIR: /app/data
       INDEX_DIR: /app/artifacts/index
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
-      LLM_API_KEY: ${LLM_API_KEY:-}
+    volumes:
+      - ./data:/app/data:ro
+      - legal-index:/app/artifacts/index
     ports:
       - "${LEGAL_API_PORT:-8000}:8000"
-    restart: unless-stopped
+    restart: on-failure
 
   webui:
-    image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.8.12}
+    build:
+      context: ./open-webui
+    image: psb-legal-webui:local
     depends_on:
-      legal-api:
-        condition: service_healthy
+      - legal-api
     environment:
-      WEBUI_NAME: "Юридический ассистент"
+      WEBUI_NAME: "ПСБ · Юридический ассистент"
       WEBUI_AUTH: "false"
       ENABLE_OLLAMA_API: "false"
       ENABLE_OPENAI_API: "true"
@@ -35,18 +39,14 @@ services:
       ENABLE_TAGS_GENERATION: "false"
       ENABLE_FOLLOW_UP_GENERATION: "false"
       ENABLE_AUTOCOMPLETE_GENERATION: "false"
-      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
-      ENABLE_WEB_SEARCH: "false"
       BYPASS_MODEL_ACCESS_CONTROL: "true"
-      RAG_EMBEDDING_ENGINE: openai
-      RAG_OPENAI_API_BASE_URL: http://legal-api:8000/v1
-      RAG_OPENAI_API_KEY: local
       OFFLINE_MODE: "true"
     volumes:
       - webui-data:/app/backend/data
     ports:
       - "${WEBUI_PORT:-3000}:8080"
-    restart: unless-stopped
+    restart: on-failure
 
 volumes:
+  legal-index: {}
   webui-data: {}

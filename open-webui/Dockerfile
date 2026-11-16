@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 ARG USE_OLLAMA=false
 ARG USE_PERMISSION_HARDENING=false
 

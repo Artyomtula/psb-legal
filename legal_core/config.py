@@ -78,7 +78,6 @@ class Settings:
     llm_concurrency: int = 12
     request_timeout: float = 90.0
     question_budget: float = 150.0
-    ui_deadline: float = 12.0
     reasoning: str = "auto"
     json_mode: bool = True
     today: date = field(default_factory=date.today)
@@ -123,7 +122,6 @@ class Settings:
             llm_concurrency=env_int("LLM_CONCURRENCY", 12, 1, 64),
             request_timeout=env_float("REQUEST_TIMEOUT", 90.0, 5.0, 600.0),
             question_budget=env_float("QUESTION_BUDGET", 150.0, 10.0, 1200.0),
-            ui_deadline=env_float("UI_DEADLINE", 12.0, 1.0, 600.0),
             reasoning=env("REASONING", default="auto").lower(),
             json_mode=env_bool("JSON_MODE", True),
             today=date.fromisoformat(today_raw) if today_raw else date.today(),
